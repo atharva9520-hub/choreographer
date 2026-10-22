@@ -1,0 +1,8 @@
+python-telegram-bot[job-queue]>=22.0
+google-genai>=1.0
+gspread>=6.0
+duckdb>=1.0
+pandas>=2.0
+python-dateutil>=2.9
+python-dotenv>=1.0
+pytest>=8.0

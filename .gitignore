@@ -1,0 +1,12 @@
+# secrets - never commit these
+.env
+service_account*.json
+*_service_account*.json
+*.json
+
+# python
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+README.html
