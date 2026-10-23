@@ -14,7 +14,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           filters)
 
 from .assistant import Assistant
-from .llm import GeminiLLM
+from .llm import make_llm
 from .logic import ChoreBook, monday_of
 from .storage import SheetsStore
 
@@ -130,7 +130,7 @@ def main():
     tz = ZoneInfo(tz_name)
 
     store = SheetsStore(os.environ["GOOGLE_SHEET_ID"], os.environ.get("GOOGLE_CREDENTIALS_FILE", "service_account.json"))
-    assistant = Assistant(ChoreBook(store), GeminiLLM(), tz_name)
+    assistant = Assistant(ChoreBook(store), make_llm(), tz_name)
     bot = ChoreBot(assistant, os.environ.get("ALLOWED_CHAT_ID") or None)
 
     app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()

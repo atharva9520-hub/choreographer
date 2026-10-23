@@ -175,7 +175,87 @@ class GeminiLLM(LLM):
         return [ToolCall(fc.name, dict(fc.args or {})) for fc in (resp.function_calls or [])]
 
     def summarize(self, question: str, rows: list[dict]) -> str:
-        prompt = (f"Question: {question}\nQuery result rows (JSON): {rows}\n"
-                  "Answer in one or two short sentences for a group chat. If there are no rows, say so plainly.")
+        prompt = SUMMARY_PROMPT.format(question=question, rows=rows)
         resp = self._generate(contents=prompt)
         return (resp.text or "").strip()
+
+
+SUMMARY_PROMPT = ("Question: {question}\nQuery result rows (JSON): {rows}\n"
+                  "Answer in one or two short sentences for a group chat. If there are no rows, say so plainly.")
+
+# OpenAI-compatible providers: name -> (base URL, API-key env var, default model)
+OPENAI_COMPATIBLE = {
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "openai/gpt-oss-120b"),
+    "xai": ("https://api.x.ai/v1", "XAI_API_KEY", "grok-4"),
+}
+
+
+class OpenAICompatibleLLM(LLM):
+    """Groq, xAI (Grok), or any other OpenAI-compatible API."""
+
+    def __init__(self, provider: str = "groq", model: str | None = None):
+        from openai import OpenAI
+
+        base_url, key_env, default_model = OPENAI_COMPATIBLE[provider]
+        self.client = OpenAI(api_key=os.environ[key_env], base_url=base_url)
+        self.model = model or os.environ.get(f"{provider.upper()}_MODEL", default_model)
+        self.tools = [{"type": "function", "function": t} for t in TOOLS]
+
+    def parse(self, message: str, system_prompt: str) -> list[ToolCall]:
+        import json
+
+        resp = self.client.chat.completions.create(
+            model=self.model, temperature=0, tools=self.tools, tool_choice="auto",
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message}],
+        )
+        calls = resp.choices[0].message.tool_calls or []
+        return [ToolCall(c.function.name, json.loads(c.function.arguments or "{}")) for c in calls]
+
+    def summarize(self, question: str, rows: list[dict]) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model, temperature=0,
+            messages=[{"role": "user", "content": SUMMARY_PROMPT.format(question=question, rows=rows)}],
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+
+class FallbackLLM(LLM):
+    """Try each provider in order; move on if one errors (rate limit, outage, bad key)."""
+
+    def __init__(self, providers: list[LLM]):
+        self.providers = providers
+
+    def _try(self, method: str, *args):
+        import logging
+
+        last = None
+        for p in self.providers:
+            try:
+                return getattr(p, method)(*args)
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("chorebot").warning("%s failed (%s); trying next provider", type(p).__name__, e)
+                last = e
+        raise last
+
+    def parse(self, message: str, system_prompt: str) -> list[ToolCall]:
+        return self._try("parse", message, system_prompt)
+
+    def summarize(self, question: str, rows: list[dict]) -> str:
+        return self._try("summarize", question, rows)
+
+
+def _build(name: str) -> LLM:
+    name = name.strip().lower()
+    if name == "gemini":
+        return GeminiLLM()
+    if name in OPENAI_COMPATIBLE:
+        return OpenAICompatibleLLM(name)
+    raise ValueError(f"Unknown LLM provider '{name}'. Use one of: gemini, {', '.join(OPENAI_COMPATIBLE)}")
+
+
+def make_llm() -> LLM:
+    """LLM_PROVIDER picks the main model; LLM_FALLBACK (optional, comma list) are backups."""
+    names = [os.environ.get("LLM_PROVIDER", "gemini")]
+    names += [n for n in os.environ.get("LLM_FALLBACK", "").split(",") if n.strip()]
+    providers = [_build(n) for n in names]
+    return providers[0] if len(providers) == 1 else FallbackLLM(providers)

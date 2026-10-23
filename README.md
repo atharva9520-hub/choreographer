@@ -12,7 +12,7 @@ All data lives in a Google Sheet in your shared Drive.
 ```mermaid
 flowchart TD
     U["Roommates<br/>(Telegram group)"] -->|plain-language message| B["Telegram bot<br/>python-telegram-bot, polling"]
-    B --> L["Gemini with tools"]
+    B --> L["LLM with tools<br/>(Groq, Gemini fallback)"]
     L -->|not chore-related| X["Ignore"]
     L -->|tool call| V["Validator<br/>names, dates, frequency"]
     V -->|settings change| C["Confirm buttons ✅/❌"]
@@ -32,7 +32,7 @@ flowchart TD
 | File | What it does |
 |---|---|
 | `chorebot/logic.py` | All chore rules: rest rotation, weekly plan, turns, busy, mark done, undo |
-| `chorebot/llm.py` | Tool definitions, system prompt, Gemini provider (swappable `LLM` interface) |
+| `chorebot/llm.py` | Tool definitions, system prompt, providers (Groq/xAI via OpenAI-compatible API, Gemini) and fallback chain |
 | `chorebot/assistant.py` | Message → LLM → validate → apply/confirm. No Telegram code, so it's testable |
 | `chorebot/query.py` | Read-only DuckDB SQL over the sheet tabs |
 | `chorebot/storage.py` | Google Sheets store (with a 60s cache) + in-memory store for tests |
@@ -46,7 +46,8 @@ flowchart TD
 2. `/setprivacy` → pick your bot → **Disable**. This lets the bot read normal group messages.
 3. Add the bot to your group. If it was already in the group, remove it and add it again so the privacy change applies.
 
-**2. Gemini key**: create one at [Google AI Studio](https://aistudio.google.com/apikey).
+**2. LLM key**: the default is [Groq](https://console.groq.com/keys) (free tier, `openai/gpt-oss-120b`) with Gemini
+([Google AI Studio](https://aistudio.google.com/apikey)) as a backup. Choose with `LLM_PROVIDER` / `LLM_FALLBACK` in `.env`.
 
 **3. Google Sheet + service account**
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and enable the **Google Sheets API**
