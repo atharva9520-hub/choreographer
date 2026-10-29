@@ -151,3 +151,26 @@ def test_update_chore_include_exclude(book):
 def test_bad_frequency_rejected(book):
     with pytest.raises(ValueError):
         book.add_chore("mop", "scheduled", "every saturday")
+
+
+def test_covering_earns_a_lighter_week(book):
+    book.add_chore("dishwasher", "scheduled", "FREQ=DAILY")
+    week1 = book.make_plan(MON)
+    rest1 = book.rest_member(MON)
+    helper = next(n for n in book.member_names() if n != rest1)
+    # helper does every task in week 1, including the other person's
+    for t in week1:
+        book.mark_done(helper, "dishwasher", date.fromisoformat(t["date"]), helper, "")
+    nxt = MON + timedelta(weeks=1)
+    week2 = book.make_plan(nxt)
+    if helper != book.rest_member(nxt):
+        mine = sum(t["assigned_to"] == helper for t in week2)
+        assert mine < len(week2) / 2
+
+
+def test_no_balancing_when_disabled(book):
+    book.compensate = False
+    book.add_chore("dishwasher", "scheduled", "FREQ=DAILY")
+    tasks = book.make_plan(MON)
+    counts = sorted([sum(t["assigned_to"] == n for t in tasks) for n in book.member_names()])
+    assert counts == [0, 3, 4]

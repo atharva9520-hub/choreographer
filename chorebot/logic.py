@@ -36,8 +36,11 @@ def parse_frequency(freq: str) -> str:
 
 
 class ChoreBook:
-    def __init__(self, store):
+    COVER_WINDOW_WEEKS = 3  # covering is evened out over the next 3 plans (1/3 per week, so each cover counts once)
+
+    def __init__(self, store, compensate: bool = True):
         self.s = store
+        self.compensate = compensate  # give fewer tasks to people who recently covered for others
 
     # ---------- lookups ----------
     def members(self) -> list[dict]:
@@ -76,6 +79,11 @@ class ChoreBook:
         key = name.strip().lower()
         if key in lookup:
             return lookup[key]
+        # 'mopping' -> 'mop', 'dishes' -> 'dishwasher', 'the trash' -> 'trash'
+        key = key.removeprefix("the ").strip()
+        stem = [n for n in lookup if len(key) >= 3 and len(n) >= 3 and (key.startswith(n) or n.startswith(key[:4]))]
+        if len(stem) == 1:
+            return lookup[stem[0]]
         close = difflib.get_close_matches(key, list(lookup), n=1, cutoff=0.7)
         return lookup[close[0]] if close else None
 
@@ -108,12 +116,7 @@ class ChoreBook:
         name = name.strip().title()
         if self.member_by_telegram(telegram_id):
             old = self.member_by_telegram(telegram_id)
-            if old.lower() == name.lower():
-                return f"You're already registered as {old}."
-            if name.lower() in (n.lower() for n in self.member_names()):
-                raise ValueError(f"{name} is already someone else.")
-            self.s.update("Members", "telegram_id", str(telegram_id), {"name": name})
-            return f"Renamed {old} to {name}."
+            return f"You're already registered as {old}."
         if name.lower() in (n.lower() for n in self.member_names()):
             # Name exists but not linked yet (e.g. added by someone else): link it.
             for m in self.members():
@@ -191,6 +194,75 @@ class ChoreBook:
         self.s.update("Chores", "name", chore["name"], changes)
         return f"Updated {self.describe(new)}"
 
+    def set_chore(self, name: str, kind: str = "", frequency: str = "", people: list[str] | None = None,
+                  add_people: list[str] | None = None, remove_people: list[str] | None = None,
+                  next_up: str = "") -> str:
+        """Create the chore if it's new, otherwise change only the fields given."""
+        existing = self.find_chore(name)
+        if existing is None:
+            if not kind:
+                kind = "scheduled" if frequency else ""
+            if not kind:
+                raise ValueError(f"How often should {name} happen? Or is it turn-based (done when needed)?")
+            members = list(people or [])
+            if add_people and members:
+                members += add_people
+            msg = self.add_chore(name, kind, frequency, members, next_up)
+            if remove_people:
+                msg = self.update_chore(name, exclude=remove_people)
+            return msg
+        if people:
+            resolved = [self.resolve_member(m) for m in people]
+            everyone = set(self.member_names())
+            self.s.update("Chores", "name", existing["name"],
+                          {"members": "" if set(resolved) == everyone else ",".join(resolved)})
+        return self.update_chore(existing["name"], frequency=frequency, include=add_people, exclude=remove_people,
+                                 type=kind, next_up=next_up)
+
+    def check_set_chore(self, name: str, kind: str = "", frequency: str = "", people=None, add_people=None,
+                        remove_people=None, next_up: str = "") -> None:
+        """Validate a set_chore request before asking for confirmation."""
+        for m in (people or []) + (add_people or []) + (remove_people or []):
+            self.resolve_member(m)
+        if next_up:
+            self.resolve_member(next_up)
+        if frequency:
+            parse_frequency(frequency)
+        if self.find_chore(name) is None and not kind and not frequency:
+            raise ValueError(f"How often should {name} happen? Or is it turn-based (done when needed)?")
+
+    def history(self, chore: str = "", member: str = "", since: str = "", until: str = "",
+                limit: int = 15) -> list[dict]:
+        """Completed tasks, newest first."""
+        c = self.find_chore(chore) if chore else None
+        chore_name = c["name"] if c else chore.strip().lower()
+        who = self.resolve_member(member) if member else ""
+        rows = [t for t in self.s.rows("Tasks") if t["status"] == "done"
+                and (not chore_name or t["chore"] == chore_name)
+                and (not who or t["done_by"] == who)
+                and (not since or t["date"] >= since[:10])
+                and (not until or t["date"] <= until[:10])]
+        rows.sort(key=lambda t: t["date"], reverse=True)
+        return [{"date": t["date"], "chore": t["chore"], "done_by": t["done_by"],
+                 "was_assigned_to": t["assigned_to"]} for t in rows[:limit]]
+
+    def undo_last(self, sender: str, member: str = "") -> str:
+        """Undo the most recent chore log or busy entry sent by `sender` (or about `member`)."""
+        who = self.resolve_member(member) if member else ""
+        for entry in reversed(self.s.rows("Log")):
+            if entry["action"] not in ("mark_done", "set_busy") or entry["undone"] == "yes":
+                continue
+            about = json.loads(entry["details"] or "{}").get("member", "")
+            if (who and about == who) or (not who and entry["sender"] == sender):
+                d = json.loads(entry["details"] or "{}")
+                what = "busy entry" if entry["action"] == "set_busy" else self._task_label(d.get("task_id", ""))
+                return self.undo(entry["id"]) + (f" ({what})" if what else "")
+        return "I couldn't find anything recent to undo."
+
+    def _task_label(self, task_id: str) -> str:
+        t = next((t for t in self.s.rows("Tasks") if t["id"] == task_id), None)
+        return f"{t['chore']} by {t['done_by'] or t['assigned_to']}" if t else ""
+
     def remove_chore(self, name: str) -> str:
         chore = self.find_chore(name)
         if not chore:
@@ -250,6 +322,7 @@ class ChoreBook:
         names = self.member_names()
         week_idx = (monday - date(2026, 1, 5)).days // 7
         counts = {n: 0 for n in names}
+        balance = self._cover_balance(monday) if self.compensate else {n: 0 for n in names}
         occurrences = []
         for c in scheduled.values():
             rule = rrulestr(c["frequency"], dtstart=RRULE_START)
@@ -266,13 +339,28 @@ class ChoreBook:
             eligible = [n for n in pool if n != rest and not self.busy_on(n, day)]
             if not eligible:  # fall back to the rest person rather than skipping the chore
                 eligible = [n for n in pool if not self.busy_on(n, day)] or pool
-            who = min(eligible, key=lambda n: (counts[n], (names.index(n) - week_idx) % len(names)))
+            who = min(eligible, key=lambda n: (counts[n] + balance.get(n, 0), counts[n],
+                                               (names.index(n) - week_idx) % len(names)))
             counts[who] += 1
             task = {"id": _id("t"), "date": day.isoformat(), "chore": c["name"],
                     "assigned_to": who, "status": "open", "done_by": ""}
             self.s.append("Tasks", task)
             new.append(task)
         return new
+
+    def _cover_balance(self, monday: date) -> dict[str, float]:
+        """Over the last few weeks: +1 each time someone did another person's scheduled task, -1 when someone
+        else did theirs. Positive = owed a lighter week."""
+        start = (monday - timedelta(weeks=self.COVER_WINDOW_WEEKS)).isoformat()
+        bal = {n: 0 for n in self.member_names()}
+        for t in self.s.rows("Tasks"):
+            if t["status"] != "done" or not (start <= t["date"] < monday.isoformat()):
+                continue
+            a, d = t["assigned_to"], t["done_by"]
+            if a and d and a != d:
+                bal[d] = bal.get(d, 0) + 1
+                bal[a] = bal.get(a, 0) - 1
+        return {n: v / self.COVER_WINDOW_WEEKS for n, v in bal.items()}
 
     # ---------- turn-based ----------
     def whose_turn(self, chore: dict, day: date) -> str:
@@ -299,6 +387,7 @@ class ChoreBook:
             self.s.append("Tasks", task)
             details = {"task_id": task["id"], "created": True}
             reply = f"✅ {member}: {task['chore']} (one-off)"
+
         elif chore["type"] == "turn":
             task = {"id": _id("t"), "date": day.isoformat(), "chore": chore["name"],
                     "assigned_to": chore["next_up"], "status": "done", "done_by": member}
@@ -323,6 +412,7 @@ class ChoreBook:
                 details = {"task_id": task["id"], "created": True}
                 extra = " (extra)"
             reply = f"✅ {member}: {chore['name']}{extra}"
+        details["member"] = member
         log_id = self.log(sender, message, "mark_done", details)
         return reply, log_id
 
@@ -366,7 +456,7 @@ class ChoreBook:
             self.s.update("Tasks", "id", t["id"], {"assigned_to": new})
             t["assigned_to"] = new
             moved.append([t["id"], member, new, t["chore"], t["date"]])
-        log_id = self.log(sender, message, "set_busy", {"busy_id": busy_id, "moved": moved})
+        log_id = self.log(sender, message, "set_busy", {"busy_id": busy_id, "moved": moved, "member": member})
         lines = [f"🗓️ {member} busy {start:%a %b %d} – {end:%a %b %d}."]
         lines += [f"  {chore} on {date.fromisoformat(d):%a} → {new}" for _, _, new, chore, d in moved]
         return "\n".join(lines), log_id
@@ -395,26 +485,33 @@ class ChoreBook:
         return "↩️ Undone."
 
     # ---------- summaries ----------
-    def day_summary(self, day: date) -> str:
-        tasks = [t for t in self.s.rows("Tasks") if t["date"] == day.isoformat() and t["status"] in ("open", "done")]
-        lines = [f"📋 {day:%A %b %d}"]
+    @staticmethod
+    def _who(t: dict) -> str:
+        return t["done_by"] if t["status"] == "done" else t["assigned_to"]
+
+    def day_summary(self, day: date, member: str | None = None) -> str:
+        tasks = [t for t in self.s.rows("Tasks") if t["date"] == day.isoformat() and t["status"] in ("open", "done")
+                 and (member is None or self._who(t) == member)]
+        lines = [f"📋 {day:%A %b %d}" + (f" · {member}" if member else "")]
         for t in sorted(tasks, key=lambda t: t["chore"]):
             mark = "✅" if t["status"] == "done" else "⬜"
             who = t["done_by"] if t["status"] == "done" else t["assigned_to"]
             lines.append(f"{mark} {t['chore']}: {who}")
         for c in self.chores():
-            if c["type"] == "turn":
+            if c["type"] == "turn" and (member is None or self.whose_turn(c, day) == member):
                 lines.append(f"🔁 {c['name']}: next is {self.whose_turn(c, day)}")
         if len(lines) == 1:
             lines.append("Nothing scheduled.")
         return "\n".join(lines)
 
-    def week_summary(self, monday: date) -> str:
+    def week_summary(self, monday: date, member: str | None = None) -> str:
         monday = monday_of(monday)
         rest = self.rest_member(monday)
-        lines = [f"🗓️ Week of {monday:%b %d}" + (f" — {rest} is resting 😴" if rest else "")]
+        lines = [f"🗓️ Week of {monday:%b %d}" + (f" · {member}" if member else "")
+                 + (f" — {rest} is resting 😴" if rest else "")]
         tasks = [t for t in self.s.rows("Tasks") if t["status"] in ("open", "done")
-                 and monday.isoformat() <= t["date"] <= (monday + timedelta(days=6)).isoformat()]
+                 and monday.isoformat() <= t["date"] <= (monday + timedelta(days=6)).isoformat()
+                 and (member is None or self._who(t) == member)]
         by_day: dict[str, list[str]] = {}
         for t in sorted(tasks, key=lambda t: (t["date"], t["chore"])):
             who = t["done_by"] if t["status"] == "done" else t["assigned_to"]
@@ -422,6 +519,8 @@ class ChoreBook:
         for d, items in by_day.items():
             lines.append(f"{date.fromisoformat(d):%a}: " + " · ".join(items))
         for c in self.chores():
-            if c["type"] == "turn":
+            if c["type"] == "turn" and (member is None or self.whose_turn(c, monday) == member):
                 lines.append(f"🔁 {c['name']}: next is {self.whose_turn(c, monday)}")
+        if member and len(lines) == 1:
+            lines.append("Nothing assigned.")
         return "\n".join(lines)

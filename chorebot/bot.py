@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import uuid
+from collections import deque
 from datetime import time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -21,16 +22,16 @@ from .storage import SheetsStore
 log = logging.getLogger("chorebot")
 UNDO_WORDS = {"undo", "undo it", "undo that", "revert", "cancel that"}
 
-HELP = """Hi! Just talk normally in this group. Examples:
-• I'm Atharva  (everyone does this once)
-• Add dishwasher every day, mop every Saturday, vacuum Wed and Sun
-• Trash is turn-based, Yuvraj goes first
-• Exclude Yuvraj from mopping
-• Yuvraj did mopping and Arihant vacuumed
-• Arihant is busy till Sunday
-• Whose turn is trash? / Who did the most this month?
-• What's the plan this week?
-Reply "undo" to any of my ✅ messages to reverse it."""
+HELP = """Hi! Just talk normally in this group, no special format needed. For example:
+• I'm Atharva  (everyone says this once)
+• Yuvraj did mopping and Ari vacuumed
+• We'll clean the bathroom every other week
+• Assign Yuvraj and Ari mopping every week
+• Trash is whenever it's full, we take turns
+• I'm out of town till Sunday
+• Who did the mopping? / Whose turn is trash? / What do I have this week?
+• Oops, undo that
+Settings changes ask for a ✅ first."""
 
 
 class ChoreBot:
@@ -39,6 +40,7 @@ class ChoreBot:
         self.allowed_chat = allowed_chat
         self.pending: dict[str, list] = {}       # button id -> tool calls awaiting ✅
         self.undo_map: dict[int, list[str]] = {}  # bot message id -> log ids
+        self.history: deque[str] = deque(maxlen=12)  # recent chat lines, so follow-ups make sense
 
     def _allowed(self, update: Update) -> bool:
         return not self.allowed_chat or str(update.effective_chat.id) == self.allowed_chat
@@ -63,14 +65,19 @@ class ChoreBot:
             await msg.reply_text(text)
             return
 
+        name = await asyncio.to_thread(book.member_by_telegram, msg.from_user.id) or msg.from_user.first_name
+        context = list(self.history)
+        self.history.append(f"{name}: {msg.text[:300]}")
         try:
             res = await asyncio.to_thread(self.a.handle_message, msg.text, msg.from_user.id,
-                                          reply_to.text if from_bot and reply_to.text else "")
+                                          reply_to.text if reply_to and reply_to.text else "", context)
         except Exception as e:  # noqa: BLE001
             log.exception("failed to handle message")
             await msg.reply_text(f"⚠️ Sorry, something went wrong on my side ({type(e).__name__}: {str(e)[:120]}). "
                                  "Try again in a bit.")
             return
+        if res.text or res.pending_text:
+            self.history.append("Bot: " + (res.text or res.pending_text)[:300].replace("\n", " | "))
         if res.text:
             sent = await msg.reply_text(res.text)
             if res.log_ids:

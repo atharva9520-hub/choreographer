@@ -3,106 +3,87 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 FREQ_HELP = (
-    "iCal RRULE without the 'RRULE:' prefix. Examples: daily='FREQ=DAILY'; every Saturday="
-    "'FREQ=WEEKLY;BYDAY=SA'; twice a week Wed+Sun='FREQ=WEEKLY;BYDAY=WE,SU'; every 2 weeks on Monday="
-    "'FREQ=WEEKLY;INTERVAL=2;BYDAY=MO'; every 3 days='FREQ=DAILY;INTERVAL=3'; monthly on the 1st="
-    "'FREQ=MONTHLY;BYMONTHDAY=1'. If the user only says 'twice a week', pick sensible spread-out days."
+    "Frequency is an iCal RRULE without 'RRULE:'. every day=FREQ=DAILY; Saturdays=FREQ=WEEKLY;BYDAY=SA; "
+    "Wed+Sun=FREQ=WEEKLY;BYDAY=WE,SU; every other week=FREQ=WEEKLY;INTERVAL=2;BYDAY=SA; every 3 days="
+    "FREQ=DAILY;INTERVAL=3; monthly on the 1st=FREQ=MONTHLY;BYMONTHDAY=1. Weekly-type with no day -> Saturday; "
+    "'twice a week' with no days -> WE,SU."
 )
 
-QUERY_SCHEMA = """DuckDB tables (all columns are TEXT; dates are 'YYYY-MM-DD'):
-members(name, telegram_id, "order")
-chores(name, type ['scheduled'|'turn'], frequency, members [comma list, '' = everyone], next_up, active ['yes'|'no'])
-tasks(id, date, chore, assigned_to, status ['open'|'done'|'cancelled'|'undone'], done_by)
-busy(id, member, start, "end", active)
-log(id, timestamp, sender, message, action, details, undone)
-Completed work = tasks where status='done' (done_by is who did it). Ignore cancelled/undone rows."""
+QUERY_SCHEMA = ("Tables (TEXT columns, dates YYYY-MM-DD): members(name), chores(name,type,frequency,members,next_up,"
+                "active), tasks(date,chore,assigned_to,status,done_by), busy(member,start,\"end\",active). "
+                "Completed work = tasks.status='done'; done_by did it.")
+
+_PEOPLE = {"type": "array", "items": {"type": "string"}}
+_STR = {"type": "string"}
 
 TOOLS = [
-    {
-        "name": "register_member",
-        "description": "ONLY when the SENDER states their own name, e.g. 'I'm Atharva'. Never use it for other people.",
-        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
-    },
-    {
-        "name": "add_member",
-        "description": "Add OTHER roommates by name, e.g. 'the other two are Yuvraj and Ari'.",
-        "parameters": {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}},
-                       "required": ["names"]},
-    },
-    {
-        "name": "add_chore",
-        "description": "Create a chore. 'scheduled' chores repeat on a frequency. 'turn' chores have no schedule "
-                       "(done when needed, e.g. trash) and rotate strictly between people.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "short lowercase name, e.g. 'mop', 'dishwasher', 'trash'"},
-            "type": {"type": "string", "enum": ["scheduled", "turn"]},
-            "frequency": {"type": "string", "description": "Only for scheduled. " + FREQ_HELP},
-            "members": {"type": "array", "items": {"type": "string"},
-                        "description": "Who shares this chore. Omit for everyone."},
-            "first_up": {"type": "string", "description": "Only for turn chores: who goes first."},
-        }, "required": ["name", "type"]},
-    },
-    {
-        "name": "update_chore",
-        "description": "Change an existing chore: frequency, include/exclude people, type, or whose turn is next.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"},
-            "frequency": {"type": "string", "description": FREQ_HELP},
-            "include": {"type": "array", "items": {"type": "string"}},
-            "exclude": {"type": "array", "items": {"type": "string"}},
-            "type": {"type": "string", "enum": ["scheduled", "turn"]},
-            "next_up": {"type": "string"},
-        }, "required": ["name"]},
-    },
-    {
-        "name": "remove_chore",
-        "description": "Delete a chore.",
-        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
-    },
-    {
-        "name": "set_rest",
-        "description": "Choose who rests (does no scheduled chores) this week; the rotation continues from there.",
-        "parameters": {"type": "object", "properties": {"member": {"type": "string"}}, "required": ["member"]},
-    },
-    {
-        "name": "mark_done",
-        "description": "Someone did one or more chores. One entry per person+chore. Works for chores done by "
-                       "the sender or reported on behalf of others, and for one-off chores not in the list.",
-        "parameters": {"type": "object", "properties": {"entries": {"type": "array", "items": {
-            "type": "object", "properties": {
-                "member": {"type": "string"},
-                "chore": {"type": "string", "description": "Existing chore name if it matches, else a short description"},
-                "date": {"type": "string", "description": "YYYY-MM-DD, default today"},
-            }, "required": ["member", "chore"]}}}, "required": ["entries"]},
-    },
-    {
-        "name": "set_busy",
-        "description": "Someone is busy/away and can't do chores for a date range; their tasks get reassigned.",
-        "parameters": {"type": "object", "properties": {
-            "member": {"type": "string"},
-            "start": {"type": "string", "description": "YYYY-MM-DD"},
-            "end": {"type": "string", "description": "YYYY-MM-DD (same as start for one day)"},
-        }, "required": ["member", "start", "end"]},
-    },
-    {
-        "name": "show_schedule",
-        "description": "Show the plan.",
-        "parameters": {"type": "object", "properties": {
-            "when": {"type": "string", "enum": ["today", "this_week", "next_week"]}}, "required": ["when"]},
-    },
-    {
-        "name": "query",
-        "description": "Answer a question about chore data/history (e.g. who did most, whose turn, how many times). "
-                       "Write one read-only DuckDB SQL query.\n" + QUERY_SCHEMA,
-        "parameters": {"type": "object", "properties": {
-            "question": {"type": "string"}, "sql": {"type": "string"}}, "required": ["question", "sql"]},
-    },
+    {"name": "mark_done", "description": "Someone did chores (the sender or someone they name). One entry per person+chore.",
+     "parameters": {"type": "object", "properties": {"entries": {"type": "array", "items": {
+         "type": "object", "properties": {
+             "member": _STR,
+             "chore": {"type": "string", "description": "existing chore name, or a short description for a one-off"},
+             "date": {"type": "string", "description": "YYYY-MM-DD, default today"}},
+         "required": ["member", "chore"]}}}, "required": ["entries"]}},
+    {"name": "set_chore", "description": "Create or change a chore (same tool for both). Fill only what the message says.",
+     "parameters": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "short lowercase name: mop, dishwasher, trash, bathroom"},
+         "kind": {"type": "string", "enum": ["scheduled", "turn"],
+                  "description": "turn = no schedule, done when needed, people take turns"},
+         "frequency": {"type": "string", "description": "RRULE, scheduled chores only"},
+         "people": {**_PEOPLE, "description": "exactly who does it (replaces current list)"},
+         "add_people": _PEOPLE, "remove_people": _PEOPLE,
+         "next_up": {"type": "string", "description": "turn chores: who is next"}}, "required": ["name"]}},
+    {"name": "remove_chore", "description": "Stop tracking a chore.",
+     "parameters": {"type": "object", "properties": {"name": _STR}, "required": ["name"]}},
+    {"name": "set_busy", "description": "Someone is away/busy/sick for a date range.",
+     "parameters": {"type": "object", "properties": {"member": _STR, "start": _STR, "end": _STR},
+                    "required": ["member", "start", "end"]}},
+    {"name": "set_rest", "description": "Who rests (no scheduled chores) this week.",
+     "parameters": {"type": "object", "properties": {"member": _STR}, "required": ["member"]}},
+    {"name": "undo_last", "description": "Take back the sender's latest logged chore/busy entry, or the latest one "
+                                         "about `member`.",
+     "parameters": {"type": "object", "properties": {"member": _STR}}},
+    {"name": "show_schedule", "description": "Show tasks for today / this week / next week, optionally one person's.",
+     "parameters": {"type": "object", "properties": {
+         "when": {"type": "string", "enum": ["today", "this_week", "next_week"]}, "member": _STR},
+         "required": ["when"]}},
+    {"name": "whose_turn", "description": "Whose turn for a turn-based chore (omit chore for all).",
+     "parameters": {"type": "object", "properties": {"chore": _STR}}},
+    {"name": "history", "description": "Who did a chore / when / what someone did. Filters optional.",
+     "parameters": {"type": "object", "properties": {
+         "question": _STR, "chore": _STR, "member": _STR, "since": _STR, "until": _STR}, "required": ["question"]}},
+    {"name": "query", "description": "Stats needing counts across people/chores. One read-only DuckDB SELECT. "
+                                     + QUERY_SCHEMA,
+     "parameters": {"type": "object", "properties": {"question": _STR, "sql": _STR}, "required": ["question", "sql"]}},
+    {"name": "register_member", "description": "ONLY when the sender gives their OWN name.",
+     "parameters": {"type": "object", "properties": {"name": _STR}, "required": ["name"]}},
+    {"name": "add_member", "description": "Add other roommates by name.",
+     "parameters": {"type": "object", "properties": {"names": _PEOPLE}, "required": ["names"]}},
+    {"name": "reply", "description": "Say something without changing anything: one short clarifying question, or "
+                                     "how-to help. Not for chit-chat.",
+     "parameters": {"type": "object", "properties": {"text": _STR}, "required": ["text"]}},
 ]
 
-CONFIRM_TOOLS = {"add_chore", "update_chore", "remove_chore", "set_rest"}
+CONFIRM_TOOLS = {"set_chore", "remove_chore", "set_rest"}
+
+EXAMPLES = """Examples (sender Atharva):
+"Yuvraj did mopping and ari vacuumed" -> mark_done [Yuvraj mop, Ari vacuum]
+"dishes ho gaye" -> mark_done [Atharva dishwasher]
+"took out the trash yesterday" -> mark_done [Atharva trash, date=yesterday]
+"scrubbed the balcony" -> mark_done [Atharva "balcony"] (one-off, don't ask)
+"we will clean the bathroom every other week" -> set_chore bathroom kind=scheduled FREQ=WEEKLY;INTERVAL=2;BYDAY=SA
+"assign Yuvraj and Ari mopping every week" -> set_chore mop FREQ=WEEKLY;BYDAY=SA people=[Yuvraj, Ari]
+"Yuvraj doesn't need to do dishes" -> set_chore dishwasher remove_people=[Yuvraj]
+"trash is whenever it's full, take turns" -> set_chore trash kind=turn
+"who did the mopping?" -> history chore=mop
+"who has done the most chores this month" -> query
+"what do I have this week" -> show_schedule this_week member=Atharva
+"I'm out of town Thu to Sun" -> set_busy Atharva
+"oops undo that" -> undo_last
+"lol same" / "rent is due friday" -> no tool"""
 
 
 @dataclass
@@ -111,20 +92,35 @@ class ToolCall:
     args: dict = field(default_factory=dict)
 
 
-def build_system_prompt(today: date, sender: str | None, members: list[str], chores: list[str]) -> str:
-    return f"""You are the chore bot in a Telegram group of roommates. You read every message.
-Today is {today:%A} {today.isoformat()} (America/Chicago).
-Sender: {sender or 'UNREGISTERED (only register_member is useful for them)'}.
-Members: {', '.join(members) or 'none yet'}.
+def build_system_prompt(today: date, sender: str | None, members: list[str], chores: list[str],
+                        examples: bool = True) -> str:
+    week = ", ".join(f"{(today + timedelta(days=i)):%a}={(today + timedelta(days=i)).isoformat()}" for i in range(-1, 7))
+    return f"""You are the chore bot in roommates' Telegram group. Read each message and call tools; people write
+casually, with typos and Hindi/English mixed.
+Today: {today:%A} {today.isoformat()}. Dates: {week}.
+Sender: {sender or 'UNREGISTERED (only register_member applies)'}. Members: {', '.join(members) or 'none yet'}.
 Chores: {'; '.join(chores) or 'none yet'}.
-
 Rules:
-- If the message is ordinary conversation and not about chores, call NO tool and reply with nothing.
-- 'I', 'me', 'mine' = the sender. Map nicknames/typos to the member list. Messages may mix Hindi/English.
-- Resolve relative dates ('yesterday', 'this weekend', 'till Sunday') to YYYY-MM-DD.
-- One message can need several tool calls or several mark_done entries.
-- Use existing chore names when the user means one of them (e.g. 'vacuumed' -> 'vacuum').
-- Only call tools; never answer in text."""
+- Not about chores -> no tool. Problems with things (a broken trash can, a noisy dishwasher) are not chores.
+- I/me/my/main/maine = the sender. Map nicknames/typos to members and to existing chore names.
+- Someone DID a task that isn't in the list -> mark_done as a one-off. Never ask whether to make it a chore.
+- Use the recent conversation for 'it', 'he', 'same for', and answers to your own questions.
+- Several tool calls or several mark_done entries per message are fine.
+- A brand-new chore with no schedule and not turn-based -> reply with one short question.
+- {FREQ_HELP}
+- Only call tools; never plain text.
+{EXAMPLES if examples else ""}"""
+
+
+def format_message(sender: str | None, text: str, history: list[str] | None = None, replied_to: str = "") -> str:
+    """The user turn sent to the model: recent chat for context, then the new message."""
+    parts = []
+    if history:
+        parts.append("Recent conversation (oldest first, for context only):\n" + "\n".join(history[-10:]))
+    if replied_to:
+        parts.append(f'The new message is a reply to: "{replied_to[:300]}"')
+    parts.append(f"NEW MESSAGE from {sender or 'unregistered user'}: {text}")
+    return "\n\n".join(parts)
 
 
 class LLM:
@@ -172,6 +168,8 @@ class GeminiLLM(LLM):
             temperature=0,
         )
         resp = self._generate(contents=message, config=config)
+        u = getattr(resp, "usage_metadata", None)
+        self.last_usage = (getattr(u, "prompt_token_count", 0) or 0, getattr(u, "candidates_token_count", 0) or 0)
         return [ToolCall(fc.name, dict(fc.args or {})) for fc in (resp.function_calls or [])]
 
     def summarize(self, question: str, rows: list[dict]) -> str:
@@ -209,6 +207,8 @@ class OpenAICompatibleLLM(LLM):
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message}],
         )
         calls = resp.choices[0].message.tool_calls or []
+        u = getattr(resp, "usage", None)
+        self.last_usage = (getattr(u, "prompt_tokens", 0) or 0, getattr(u, "completion_tokens", 0) or 0)
         return [ToolCall(c.function.name, json.loads(c.function.arguments or "{}")) for c in calls]
 
     def summarize(self, question: str, rows: list[dict]) -> str:

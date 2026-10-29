@@ -14,6 +14,7 @@ SCHEMA: dict[str, list[str]] = {
     "Busy": ["id", "member", "start", "end", "active"],
     "Log": ["id", "timestamp", "sender", "message", "action", "details", "undone"],
     "Settings": ["key", "value"],
+    "Messages": ["timestamp", "sender", "text", "tool_calls", "reply"],
 }
 
 
@@ -52,7 +53,12 @@ class SheetsStore:
 
     def ws(self, tab: str):
         if tab not in self._ws:
-            self._ws[tab] = self.book.worksheet(tab)
+            try:
+                self._ws[tab] = self.book.worksheet(tab)
+            except gspread.exceptions.WorksheetNotFound:  # tab added in a newer version: create it
+                ws = self.book.add_worksheet(title=tab, rows=1000, cols=len(SCHEMA[tab]))
+                ws.append_row(SCHEMA[tab])
+                self._ws[tab] = ws
         return self._ws[tab]
 
     def _rows(self, tab: str) -> list[dict]:
@@ -71,7 +77,8 @@ class SheetsStore:
         row = _clean(row, tab)
         self.ws(tab).append_row([row[c] for c in SCHEMA[tab]], value_input_option="RAW",
                                 table_range="A1")
-        self._rows(tab).append(row)
+        if tab in self._cache:  # keep the cache current without re-reading the tab
+            self._cache[tab][1].append(row)
 
     def update(self, tab: str, key: str, value: str, changes: dict) -> bool:
         cols = SCHEMA[tab]

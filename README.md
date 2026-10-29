@@ -82,6 +82,20 @@ Settings changes show ✅/❌ buttons. After that, just log work normally:
 `whose turn is trash?` · `who did the most chores this month?`.
 To reverse a logged chore or busy entry, reply **undo** to the bot's message.
 
+## Evaluation
+
+Three kinds of numbers, each with its own script:
+
+| What | Command | Measures |
+|---|---|---|
+| Language layer | `python -m evals.run_evals --models groq,gemini --variants full,no_examples,no_history` | Accuracy on 116 held-out group-chat messages across 13 categories, false triggers on ordinary chat, missed messages, latency, tokens; per model and prompt variant |
+| Scheduling engine | `python -m evals.engine_metrics` and `python -m evals.engine_metrics compare` | A simulated year: rule violations, weekly balance, yearly fairness, busy reassignment, turn order, plan build time |
+| Real use | `python -m evals.usage_report` | From the live sheet: messages handled, actions, undo rate, completion rate, covering |
+
+Benchmark reports are written to `evals/results/`. The benchmark messages never appear in the prompt's examples
+(a test enforces this). Every live message and the model's decision is also saved in the **Messages** tab; when the
+bot misreads one, add it to `evals/cases.py` with the right answer.
+
 ## Hosting
 
 The bot uses long polling, so it only needs to run on a machine that stays on. No public URL is required.
